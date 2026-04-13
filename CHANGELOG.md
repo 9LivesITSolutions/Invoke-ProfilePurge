@@ -6,6 +6,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
 
+## [2.5.7] - 2026-04-12
+
+### Changed
+- **System account exclusion is now SID-based** (language-independent). The previous hardcoded name list (`SYSTEM`, `LOCAL SERVICE`, `NetworkService`, `Administrateur`…) failed on non-English Windows. Replaced by:
+  - Exact SID match: `S-1-5-18` (SYSTEM), `S-1-5-19` (LOCAL SERVICE), `S-1-5-20` (NETWORK SERVICE)
+  - Suffix match: `*-500` (built-in Administrator in any language), `*-501` (Guest), `*-503` (DefaultAccount)
+  - Machine account pattern: SAM name ending with `$` (domain computer accounts)
+- `$ExcludeUsers` / `$ExcludeFile` now handle **user-supplied exclusions only**. The system default list is removed.
+- Exclusion reason now shows which type triggered: `System SID (S-1-5-18)`, `Machine account (trailing $)`, or `Exclusion rule match`.
+
+---
+
 ## [2.5.6] - 2026-04-11
 
 ### Fixed

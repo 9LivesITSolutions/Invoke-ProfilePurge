@@ -174,7 +174,7 @@ $ErrorActionPreference = 'Stop'
 $Script:IsWhatIf  = $PSBoundParameters.ContainsKey('WhatIf')
 $WhatIfPreference = $false
 
-$Script:Version   = '2.5.6'
+$Script:Version   = '2.5.7'
 $Script:StartTime = Get-Date
 $Script:ExitCode  = 0
 
@@ -323,12 +323,32 @@ $PurgeProfilesBlock = {
         $localPath = $profile.LocalPath
         if (-not $localPath) { continue }
         $username = Split-Path $localPath -Leaf
+        $sid      = if ($profile.SID) { $profile.SID } else { '' }
 
-        # Exclusions (wildcards + comptes machine)
-        $excluded = ($username -match '\$$')
-        if (-not $excluded) {
-            foreach ($rule in $Exclusions) { if ($username -like $rule) { $excluded = $true; break } }
+        # ── SID-based system account exclusion (language-independent) ─────────
+        # Exact well-known SIDs:
+        #   S-1-5-18 = SYSTEM / LocalSystem
+        #   S-1-5-19 = NT AUTHORITY\LOCAL SERVICE
+        #   S-1-5-20 = NT AUTHORITY\NETWORK SERVICE
+        # Suffix-based (domain prefix varies per environment):
+        #   *-500 = Built-in Administrator  (all languages: Administrateur, Administrador, Administratör...)
+        #   *-501 = Built-in Guest          (all languages: Invité, Guest, Gast, Gjest...)
+        #   *-503 = DefaultAccount
+        $wellKnownSIDs = [System.Collections.Generic.HashSet[string]]::new(
+            [string[]]@('S-1-5-18','S-1-5-19','S-1-5-20'),
+            [System.StringComparer]::OrdinalIgnoreCase)
+
+        $isSysAccount     = $wellKnownSIDs.Contains($sid) -or
+                            $sid.EndsWith('-500') -or $sid.EndsWith('-501') -or $sid.EndsWith('-503')
+        $isMachineAccount = $username -match '\$$'   # SAM trailing $ = domain computer account
+
+        # User-supplied exclusions (wildcards supported, applied on folder name)
+        $isUserExcluded = $false
+        foreach ($rule in $Exclusions) {
+            if ($username -like $rule) { $isUserExcluded = $true; break }
         }
+
+        $excluded = $isSysAccount -or $isMachineAccount -or $isUserExcluded
 
         # Domain duplicate detection: name contains a dot AND base name exists in local index
         $isDomainDup     = $false
@@ -351,7 +371,10 @@ $PurgeProfilesBlock = {
         $status = $reason = ''
 
         if ($excluded) {
-            $status = 'Excluded'; $reason = 'Whitelist / system account'
+            $excReason = if ($isSysAccount)     { "System SID ($sid)" }
+                         elseif ($isMachineAccount) { 'Machine account (trailing $)' }
+                         else                   { "Exclusion rule match" }
+            $status = 'Excluded'; $reason = $excReason
         }
         elseif ($isDomainDup) {
             # --- Logique reparation doublon domaine ---
@@ -559,7 +582,7 @@ $PurgeBackupFoldersBlock = {
         return [PSCustomObject]@{
             Phase='BackupFolder'; ComputerName=$env:COMPUTERNAME; Identifier='N/A'; Detail=$RootPath
             LastActivity=$null; DaysInactive=$null; Loaded=$false; Status='Error'
-            Reason="Failed to list $RootPath: $_"
+            Reason="Failed to list ${RootPath}: $_"
         }
     }
     foreach ($folder in $backupFolders) {
@@ -599,11 +622,10 @@ if ($Parallel.IsPresent -and -not $useParallel) {
 
 try {
 
-    # Build exclusion list
-    [string[]]$MergedExclusions = @(
-        'Default','Default User','Public','NetworkService',
-        'LocalService','systemprofile','SYSTEM','NETWORK SERVICE','LOCAL SERVICE'
-    )
+    # Build exclusion list (user-supplied only)
+    # System accounts (SYSTEM, LOCAL SERVICE, NETWORK SERVICE, Administrator, Guest...)
+    # are now excluded via SID inside the scriptblock -- language-independent.
+    [string[]]$MergedExclusions = @()
     if ($ExcludeUsers) { $MergedExclusions += $ExcludeUsers }
     if ($ExcludeFile) {
         $MergedExclusions += Get-Content $ExcludeFile |
