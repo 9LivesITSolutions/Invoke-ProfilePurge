@@ -47,7 +47,7 @@
 
 ```powershell
 # Clone or download
-git clone https://github.com/9lives-it/Invoke-ProfilePurge.git
+git clone https://github.com/9LivesITSolutions/Invoke-ProfilePurge.git
 cd Invoke-ProfilePurge
 
 # Optional: allow script execution
