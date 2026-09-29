@@ -10,7 +10,10 @@
 
     1. INACTIVE PROFILES (always active)
        Deletes profiles inactive for more than N days.
-       Conservative criterion: Max(folder LastWriteTime, CIM LastUseTime).
+       Criterion: CIM LastUseTime (registry, login-based).
+       Fallback to folder LastWriteTime only when LastUseTime is absent.
+       WARNING: folder LastWriteTime is unreliable -- services, antivirus, and
+       Windows Search can update it without any real user activity.
        Clean removal via Win32_UserProfile (folder + ProfileList registry key).
 
     2. REGISTRY *.BAK KEYS  (-PurgeProfileListBak)
@@ -146,7 +149,7 @@ param(
     [switch]$PurgeProfileListBak,
     [switch]$PurgeBackupFolders,
     [string]$UsersPath = 'C:\Users',
-    [string]$LogPath = $PSScriptRoot,
+    [string]$LogPath = '',
     [ValidateRange(1, 365)]
     [int]$LogRetentionDays = 30,
     [string]$ReportPath,
@@ -171,10 +174,17 @@ $ErrorActionPreference = 'Stop'
 # We capture the flag first, then neutralize propagation.
 # IMPORTANT: $WhatIfPreference is a [bool], NOT an action preference string.
 # 'SilentlyContinue' is a non-empty string = truthy = WhatIf ON. Use $false.
+# Resolve LogPath here — $PSScriptRoot is empty inside param() when called via
+# powershell.exe -File. Evaluated after param block, it is always populated.
+if (-not $LogPath) {
+    $LogPath = if ($PSScriptRoot) { $PSScriptRoot }
+               else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+}
+
 $Script:IsWhatIf  = $PSBoundParameters.ContainsKey('WhatIf')
 $WhatIfPreference = $false
 
-$Script:Version   = '2.5.7'
+$Script:Version   = '2.7.2'
 $Script:StartTime = Get-Date
 $Script:ExitCode  = 0
 
@@ -273,11 +283,251 @@ $PurgeProfilesBlock = {
     param([int]$Days, [bool]$DryRun, [bool]$RepairDups, [bool]$DoStopWSearch, [bool]$DelUnknownDate, [string[]]$Exclusions)
     $results = [System.Collections.Generic.List[PSObject]]::new()
 
-    # ── Arret de Windows Search avant la purge ────────────────────────────────
-    # WSearch locks ntuser.dat.LOG and prevents Remove-CimInstance from deleting
-    # the profile folder. Stop it if running, restart after purge.
+    # ── Privilege activation ───────────────────────────────────────────────────
+    # SeRestorePrivilege and SeBackupPrivilege are HELD by SYSTEM but not always
+    # ENABLED in the active token (scheduled task context, WMI calls, etc.).
+    # Without them, Remove-Item on protected HKLM registry keys and certain
+    # profile folders returns ERROR_ACCESS_DENIED even under SYSTEM.
+    # AdjustTokenPrivileges enables them in the current process token.
+    # Enable SeRestorePrivilege -- required for Win32_UserProfile deletion via WMI/CIM.
+    # The privilege is HELD by SYSTEM/Admin tokens but not always ENABLED.
+    # AdjustTokenPrivileges activates it in the current process token.
+    # NOTE: struct must be public (not internal) for Add-Type to compile correctly.
+    $privCode = @'
+using System;
+using System.Runtime.InteropServices;
+public static class PrivHelper {
+    [DllImport("advapi32.dll", SetLastError=true)]
+    public static extern bool OpenProcessToken(IntPtr h, uint acc, out IntPtr tok);
+    [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Auto)]
+    public static extern bool LookupPrivilegeValue(string sys, string name, out long luid);
+    [DllImport("advapi32.dll", SetLastError=true)]
+    public static extern bool AdjustTokenPrivileges(IntPtr tok, bool dis, ref TPriv tp, uint buf, IntPtr prev, IntPtr ret);
+    [StructLayout(LayoutKind.Sequential, Pack=1)]
+    public struct TPriv { public int Count; public long Luid; public int Attr; }
+    public static bool Enable(string priv) {
+        IntPtr t = IntPtr.Zero;
+        if (!OpenProcessToken(System.Diagnostics.Process.GetCurrentProcess().Handle, 0x28, out t)) return false;
+        long l = 0;
+        if (!LookupPrivilegeValue(null, priv, out l)) return false;
+        var tp = new TPriv { Count = 1, Luid = l, Attr = 2 };
+        AdjustTokenPrivileges(t, false, ref tp, 0, IntPtr.Zero, IntPtr.Zero);
+        return (Marshal.GetLastWin32Error() == 0);
+    }
+}
+'@
+    try {
+        if (-not ('PrivHelper' -as [type])) { Add-Type -TypeDefinition $privCode -ErrorAction Stop }
+        $seRestore = [PrivHelper]::Enable('SeRestorePrivilege')
+        $seBackup  = [PrivHelper]::Enable('SeBackupPrivilege')
+        if (-not $seRestore) {
+            $warnMsg = "SeRestorePrivilege NOT enabled -- running as: $([Security.Principal.WindowsIdentity]::GetCurrent().Name). " +
+                       "Remove-CimInstance (Win32_UserProfile.Delete) requires this privilege. " +
+                       "Run as SYSTEM (Task Scheduler / PsExec -s) or add account to Backup Operators."
+            Write-Host "  [WARN] $warnMsg" -ForegroundColor Red
+            Add-Content -Path $LogFile -Value "$(Get-Date -f 'yyyy-MM-dd HH:mm:ss') [!] [WARN] $warnMsg" -Encoding UTF8 -WhatIf:$false
+        }
+    } catch {
+        Write-Host "  [WARN] Privilege activation failed: $_" -ForegroundColor Yellow
+        Add-Content -Path $LogFile -Value "$(Get-Date -f 'yyyy-MM-dd HH:mm:ss') [!] [WARN] Privilege activation failed: $_" -Encoding UTF8 -WhatIf:$false
+    }
+
+    # ── PASS 1: enumerate profiles and compute all decisions BEFORE touching WSearch
+    # Stopping WSearch flushes its index files into profile folders, updating their
+    # LastWriteTime to "now" -- which would make eligible profiles appear recently
+    # active and escape deletion. All date calculations must happen first.
+    try {
+        $allProfiles = @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop |
+                         Where-Object { -not $_.Special })
+    }
+    catch {
+        return [PSCustomObject]@{
+            Phase='Profile'; ComputerName=$env:COMPUTERNAME; Identifier='N/A'; Detail='N/A'
+            LastActivity=$null; DaysInactive=$null; Loaded=$false; Status='Error'
+            Reason="Win32_UserProfile not accessible: $_"
+        }
+    }
+
+    # Pre-pass: index of profiles with no dot in name (local profile candidates)
+    $localIndex = @{}
+    foreach ($p in $allProfiles) {
+        if ($p.LocalPath) {
+            $base = Split-Path $p.LocalPath -Leaf
+            if ($base.IndexOf('.') -lt 0) { $localIndex[$base.ToLower()] = $p }
+        }
+    }
+
+    # Decision objects built during Pass 1 (no deletions yet)
+    $decisions = [System.Collections.Generic.List[PSObject]]::new()
+
+    foreach ($profile in $allProfiles) {
+        $localPath = $profile.LocalPath
+        if (-not $localPath) { continue }
+        $username = Split-Path $localPath -Leaf
+        $sid      = if ($profile.SID) { $profile.SID } else { '' }
+
+        # ── SID-based system account exclusion (language-independent) ─────────
+        # Exact well-known SIDs:
+        #   S-1-5-18 = SYSTEM / LocalSystem
+        #   S-1-5-19 = NT AUTHORITY\LOCAL SERVICE
+        #   S-1-5-20 = NT AUTHORITY\NETWORK SERVICE
+        # Suffix-based (domain prefix varies per environment):
+        #   *-500 = Built-in Administrator  (all languages)
+        #   *-501 = Built-in Guest          (all languages)
+        #   *-503 = DefaultAccount
+        $wellKnownSIDs = [System.Collections.Generic.HashSet[string]]::new(
+            [string[]]@('S-1-5-18','S-1-5-19','S-1-5-20'),
+            [System.StringComparer]::OrdinalIgnoreCase)
+
+        $isSysAccount     = $wellKnownSIDs.Contains($sid) -or
+                            $sid.EndsWith('-500') -or $sid.EndsWith('-501') -or $sid.EndsWith('-503')
+        $isMachineAccount = $username -match '\$$'
+
+        $isUserExcluded = $false
+        foreach ($rule in $Exclusions) {
+            if ($username -like $rule) { $isUserExcluded = $true; break }
+        }
+        $excluded = $isSysAccount -or $isMachineAccount -or $isUserExcluded
+
+        # Domain duplicate detection
+        $isDomainDup      = $false
+        $localCounterpart = $null
+        if ($RepairDups -and -not $excluded -and $username.IndexOf('.') -ge 0) {
+            $baseName = $username.Substring(0, $username.IndexOf('.'))
+            if ($localIndex.ContainsKey($baseName.ToLower())) {
+                $localCounterpart = $localIndex[$baseName.ToLower()]
+                $isDomainDup      = $true
+            }
+        }
+
+        # Compute last activity.
+        # Criterion: Max(ntuser.dat LastWriteTime, CIM LastUseTime)
+        #
+        # ntuser.dat LastWriteTime : written at user logoff when Windows commits the registry
+        #   hive. Not modified by WSearch (read-only open for indexing), AV scans, or backup
+        #   agents. Most reliable filesystem indicator of real user activity.
+        #
+        # CIM LastUseTime : stored in HKLM\ProfileList\<SID>, updated at user logoff.
+        #   Reliable for interactive sessions; may be null for old profiles or abrupt logoffs.
+        #
+        # Profile folder LastWriteTime : last resort only — highly contaminated by WSearch,
+        #   antivirus, shadow copy, scheduled tasks writing anywhere in the profile tree.
+        $dates = [System.Collections.Generic.List[datetime]]::new()
+        $ntUserDat = Join-Path $localPath 'ntuser.dat'
+        if (Test-Path $ntUserDat -PathType Leaf) {
+            try { $dates.Add((Get-Item $ntUserDat -Force).LastWriteTime) } catch {}
+        }
+        if ($profile.LastUseTime) {
+            try { $dates.Add([datetime]$profile.LastUseTime) } catch {}
+        }
+        # Folder LastWriteTime: only if ntuser.dat and LastUseTime are both unavailable
+        if ($dates.Count -eq 0 -and (Test-Path $localPath)) {
+            try { $dates.Add((Get-Item $localPath -Force).LastWriteTime) } catch {}
+        }
+        $lastActivity = if ($dates.Count -gt 0) { ($dates | Sort-Object -Descending)[0] } else { $null }
+        $daysOld      = if ($lastActivity) { [int]((Get-Date) - $lastActivity).TotalDays } else { $null }
+
+        # Determine action (no side effects — WSearch still running)
+        $action = $null   # null = no deletion needed
+
+        if ($excluded) {
+            $excReason = if ($isSysAccount) { "System SID ($sid)" }
+                         elseif ($isMachineAccount) { 'Machine account (trailing $)' }
+                         else { 'Exclusion rule match' }
+            $decisions.Add([PSCustomObject]@{
+                Profile=$profile; LocalPath=$localPath; Username=$username; SID=$sid
+                LastActivity=$lastActivity; DaysOld=$daysOld; IsDomainDup=$false; LocalCounterpart=$null
+                Action='Excluded'; Reason=$excReason
+            })
+            continue
+        }
+        if ($isDomainDup) {
+            if ($profile.Loaded) {
+                $decisions.Add([PSCustomObject]@{
+                    Profile=$profile; LocalPath=$localPath; Username=$username; SID=$sid
+                    LastActivity=$lastActivity; DaysOld=$daysOld; IsDomainDup=$true; LocalCounterpart=$localCounterpart
+                    Action='SkippedLoaded'; Reason='Domain duplicate -- active session, repair not possible'
+                })
+            }
+            else {
+                # Same criterion: Max(ntuser.dat LastWriteTime, CIM LastUseTime)
+                $lDates = [System.Collections.Generic.List[datetime]]::new()
+                if ($localCounterpart.LocalPath) {
+                    $lNtDat = Join-Path $localCounterpart.LocalPath 'ntuser.dat'
+                    if (Test-Path $lNtDat -PathType Leaf) {
+                        try { $lDates.Add((Get-Item $lNtDat -Force).LastWriteTime) } catch {}
+                    }
+                }
+                if ($localCounterpart.LastUseTime) {
+                    try { $lDates.Add([datetime]$localCounterpart.LastUseTime) } catch {}
+                }
+                if ($lDates.Count -eq 0 -and $localCounterpart.LocalPath -and (Test-Path $localCounterpart.LocalPath)) {
+                    try { $lDates.Add((Get-Item $localCounterpart.LocalPath -Force).LastWriteTime) } catch {}
+                }
+                $lLastActivity = if ($lDates.Count -gt 0) { ($lDates | Sort-Object -Descending)[0] } else { $null }
+                $lDaysOld      = if ($lLastActivity) { [int]((Get-Date) - $lLastActivity).TotalDays } else { $null }
+                $localViable   = (Test-Path $localCounterpart.LocalPath) -and
+                                 ($null -ne $lLastActivity) -and ($lDaysOld -lt $Days)
+                $decisions.Add([PSCustomObject]@{
+                    Profile=$profile; LocalPath=$localPath; Username=$username; SID=$sid
+                    LastActivity=$lastActivity; DaysOld=$daysOld; IsDomainDup=$true; LocalCounterpart=$localCounterpart
+                    Action=$(if ($localViable) {'RepairDup'} else {'SkippedNotViable'})
+                    Reason=$(if ($localViable) {"Domain duplicate -- repoint to $($localCounterpart.LocalPath)"}
+                             else {'Domain duplicate -- local profile not viable or also eligible for deletion'})
+                })
+            }
+            continue
+        }
+        if ($profile.Loaded) {
+            $decisions.Add([PSCustomObject]@{
+                Profile=$profile; LocalPath=$localPath; Username=$username; SID=$sid
+                LastActivity=$lastActivity; DaysOld=$daysOld; IsDomainDup=$false; LocalCounterpart=$null
+                Action='SkippedLoaded'; Reason='Active session (profile loaded)'
+            })
+            continue
+        }
+        if ($null -eq $lastActivity) {
+            $decisions.Add([PSCustomObject]@{
+                Profile=$profile; LocalPath=$localPath; Username=$username; SID=$sid
+                LastActivity=$lastActivity; DaysOld=$daysOld; IsDomainDup=$false; LocalCounterpart=$null
+                Action=$(if ($DelUnknownDate) {'DeleteUnknown'} else {'SkippedUnknown'})
+                Reason=$(if ($DelUnknownDate) {'Unknown date (-DeleteUnknownDate active)'}
+                         else {'Unknown date -- skipped (use -DeleteUnknownDate to force)'})
+            })
+            continue
+        }
+        if ($daysOld -ge $Days) {
+            $decisions.Add([PSCustomObject]@{
+                Profile=$profile; LocalPath=$localPath; Username=$username; SID=$sid
+                LastActivity=$lastActivity; DaysOld=$daysOld; IsDomainDup=$false; LocalCounterpart=$null
+                Action='Delete'; Reason="Inactive for ${daysOld}d"
+            })
+        }
+        else {
+            $decisions.Add([PSCustomObject]@{
+                Profile=$profile; LocalPath=$localPath; Username=$username; SID=$sid
+                LastActivity=$lastActivity; DaysOld=$daysOld; IsDomainDup=$false; LocalCounterpart=$null
+                Action='Keep'; Reason="Active ${daysOld}d ago"
+            })
+        }
+    }
+
+    # ── PASS 2: stop WSearch NOW (dates already computed), then execute deletions
+    # Diagnostic: log Pass 1 decision breakdown — tells us if issue is in Pass 1 or Pass 2
+    $diagCounts = @{}
+    foreach ($d in $decisions) {
+        if (-not $diagCounts.ContainsKey($d.Action)) { $diagCounts[$d.Action] = 0 }
+        $diagCounts[$d.Action]++
+    }
+    $diagStr = ($diagCounts.GetEnumerator() | Sort-Object Name |
+                ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ', '
+    Write-Host "  [DIAG] $($env:COMPUTERNAME) | DryRun=$DryRun | $($decisions.Count) profiles | $diagStr" -ForegroundColor DarkCyan
+
     $wSearchWasRunning = $false
-    if ($DoStopWSearch -and -not $DryRun) {
+    $needsStop = $DoStopWSearch -and -not $DryRun -and
+                 (@($decisions | Where-Object { $_.Action -in 'Delete','DeleteUnknown','RepairDup' }).Count -gt 0)
+
+    if ($needsStop) {
         try {
             $svc = Get-Service -Name 'WSearch' -ErrorAction Stop
             if ($svc.Status -eq 'Running') {
@@ -295,189 +545,66 @@ $PurgeProfilesBlock = {
             })
         }
     }
-    try {
-        $allProfiles = @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop |
-                         Where-Object { -not $_.Special })
-    }
-    catch {
-        return [PSCustomObject]@{
-            Phase='Profile'; ComputerName=$env:COMPUTERNAME; Identifier='N/A'; Detail='N/A'
-            LastActivity=$null; DaysInactive=$null; Loaded=$false; Status='Error'
-            Reason="Win32_UserProfile not accessible: $_"
-        }
-    }
 
-    # Pre-pass: index of profiles with no dot in name (local profile candidates)
-    # Key = lowercase basename, value = CIM object
-    $localIndex = @{}
-    foreach ($p in $allProfiles) {
-        if ($p.LocalPath) {
-            $base = Split-Path $p.LocalPath -Leaf
-            if ($base.IndexOf('.') -lt 0) {
-                $localIndex[$base.ToLower()] = $p
-            }
-        }
-    }
-
-    foreach ($profile in $allProfiles) {
-        $localPath = $profile.LocalPath
-        if (-not $localPath) { continue }
-        $username = Split-Path $localPath -Leaf
-        $sid      = if ($profile.SID) { $profile.SID } else { '' }
-
-        # ── SID-based system account exclusion (language-independent) ─────────
-        # Exact well-known SIDs:
-        #   S-1-5-18 = SYSTEM / LocalSystem
-        #   S-1-5-19 = NT AUTHORITY\LOCAL SERVICE
-        #   S-1-5-20 = NT AUTHORITY\NETWORK SERVICE
-        # Suffix-based (domain prefix varies per environment):
-        #   *-500 = Built-in Administrator  (all languages: Administrateur, Administrador, Administratör...)
-        #   *-501 = Built-in Guest          (all languages: Invité, Guest, Gast, Gjest...)
-        #   *-503 = DefaultAccount
-        $wellKnownSIDs = [System.Collections.Generic.HashSet[string]]::new(
-            [string[]]@('S-1-5-18','S-1-5-19','S-1-5-20'),
-            [System.StringComparer]::OrdinalIgnoreCase)
-
-        $isSysAccount     = $wellKnownSIDs.Contains($sid) -or
-                            $sid.EndsWith('-500') -or $sid.EndsWith('-501') -or $sid.EndsWith('-503')
-        $isMachineAccount = $username -match '\$$'   # SAM trailing $ = domain computer account
-
-        # User-supplied exclusions (wildcards supported, applied on folder name)
-        $isUserExcluded = $false
-        foreach ($rule in $Exclusions) {
-            if ($username -like $rule) { $isUserExcluded = $true; break }
-        }
-
-        $excluded = $isSysAccount -or $isMachineAccount -or $isUserExcluded
-
-        # Domain duplicate detection: name contains a dot AND base name exists in local index
-        $isDomainDup     = $false
-        $localCounterpart = $null
-        if ($RepairDups -and -not $excluded -and $username.IndexOf('.') -ge 0) {
-            $baseName = $username.Substring(0, $username.IndexOf('.'))
-            if ($localIndex.ContainsKey($baseName.ToLower())) {
-                $localCounterpart = $localIndex[$baseName.ToLower()]
-                $isDomainDup      = $true
-            }
-        }
-
-        # Compute this profile's last activity
-        $dates = [System.Collections.Generic.List[datetime]]::new()
-        if (Test-Path $localPath) { try { $dates.Add((Get-Item $localPath -Force).LastWriteTime) } catch {} }
-        if ($profile.LastUseTime) { try { $dates.Add([datetime]$profile.LastUseTime) } catch {} }
-        $lastActivity = if ($dates.Count -gt 0) { ($dates | Sort-Object -Descending)[0] } else { $null }
-        $daysOld      = if ($lastActivity) { [int]((Get-Date) - $lastActivity).TotalDays } else { $null }
-
+    # Execute decisions
+    foreach ($d in $decisions) {
         $status = $reason = ''
-
-        if ($excluded) {
-            $excReason = if ($isSysAccount)     { "System SID ($sid)" }
-                         elseif ($isMachineAccount) { 'Machine account (trailing $)' }
-                         else                   { "Exclusion rule match" }
-            $status = 'Excluded'; $reason = $excReason
-        }
-        elseif ($isDomainDup) {
-            # --- Logique reparation doublon domaine ---
-            if ($profile.Loaded) {
-                $status = 'Skipped'
-                $reason = "Domain duplicate -- session active, reparation impossible"
-            }
-            else {
-                # Verification viabilite du profil local cible
-                $lDates = [System.Collections.Generic.List[datetime]]::new()
-                if ($localCounterpart.LocalPath -and (Test-Path $localCounterpart.LocalPath)) {
-                    try { $lDates.Add((Get-Item $localCounterpart.LocalPath -Force).LastWriteTime) } catch {}
-                }
-                if ($localCounterpart.LastUseTime) {
-                    try { $lDates.Add([datetime]$localCounterpart.LastUseTime) } catch {}
-                }
-                $lLastActivity = if ($lDates.Count -gt 0) { ($lDates | Sort-Object -Descending)[0] } else { $null }
-                $lDaysOld      = if ($lLastActivity) { [int]((Get-Date) - $lLastActivity).TotalDays } else { $null }
-                # Local profile viable = exists on disk AND not eligible for age-based deletion
-                $localViable = (Test-Path $localCounterpart.LocalPath) -and
-                               ($null -ne $lLastActivity) -and ($lDaysOld -lt $Days)
-
-                if (-not $localViable) {
-                    $status = 'Skipped'
-                    $reason = "Domain duplicate -- local profile not viable or also eligible for deletion"
-                }
-                elseif ($DryRun) {
-                    $status = 'WhatIf'
-                    $reason = "Domain duplicate -- would repoint to $($localCounterpart.LocalPath) and delete folder"
-                }
+        switch ($d.Action) {
+            'Excluded'         { $status='Excluded'; $reason=$d.Reason }
+            'SkippedLoaded'    { $status='Skipped';  $reason=$d.Reason }
+            'SkippedUnknown'   { $status='Skipped';  $reason=$d.Reason }
+            'SkippedNotViable' { $status='Skipped';  $reason=$d.Reason }
+            'Keep'             { $status='Kept';     $reason=$d.Reason }
+            'DeleteUnknown'    {
+                if ($DryRun) { $status='WhatIf'; $reason="Would be deleted -- $($d.Reason)" }
                 else {
                     try {
-                        # 1. Repointer l entree SID du compte domaine vers le profil local
-                        $sidRegPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($profile.SID)"
+                        # Remove-CimInstance calls Win32_UserProfile.Delete() which handles
+                        # registry cleanup, ACL-protected folders, and locked files internally.
+                        $d.Profile | Remove-CimInstance -WhatIf:$false -ErrorAction Stop
+                        $status='Deleted'; $reason="Deleted -- $($d.Reason)"
+                    }
+                    catch { $status='Error'; $reason=$_.Exception.Message }
+                }
+            }
+            'Delete'           {
+                if ($DryRun) { $status='WhatIf'; $reason="Would be deleted -- $($d.Reason)" }
+                else {
+                    try {
+                        $d.Profile | Remove-CimInstance -WhatIf:$false -ErrorAction Stop
+                        $status='Deleted'; $reason="Deleted -- $($d.Reason)"
+                    }
+                    catch { $status='Error'; $reason=$_.Exception.Message }
+                }
+            }
+            'RepairDup'        {
+                if ($DryRun) { $status='WhatIf'; $reason="Would repoint to $($d.LocalCounterpart.LocalPath) and delete folder" }
+                else {
+                    try {
+                        $sidRegPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($d.SID)"
                         Set-ItemProperty -Path $sidRegPath -Name 'ProfileImagePath' `
-                                         -Value $localCounterpart.LocalPath -WhatIf:$false -ErrorAction Stop
-                        # 2. Supprimer le dossier .DOMAINE (pas Remove-CimInstance -- on conserve l entree SID)
-                        Remove-Item -Path $localPath -Recurse -Force -WhatIf:$false -ErrorAction Stop
-                        $status = 'Repaired'
-                        $reason = "Repointed SID -> $($localCounterpart.LocalPath) | Domain folder deleted"
+                                         -Value $d.LocalCounterpart.LocalPath -WhatIf:$false -ErrorAction Stop
+                        Remove-Item -Path $d.LocalPath -Recurse -Force -WhatIf:$false -ErrorAction Stop
+                        $status='Repaired'; $reason="Repointed SID -> $($d.LocalCounterpart.LocalPath) | Domain folder deleted"
                     }
-                    catch {
-                        $status = 'Error'
-                        $reason = "Duplicate repair failed: $($_.Exception.Message)"
-                    }
+                    catch { $status='Error'; $reason="Duplicate repair failed: $($_.Exception.Message)" }
                 }
             }
         }
-        elseif ($profile.Loaded) {
-            $status = 'Skipped'; $reason = 'Active session (profile loaded)'
-        }
-        elseif ($null -eq $lastActivity) {
-            # Date totalement inconnue (LastWriteTime illisible + LastUseTime CIM absent)
-            # Ces profils sont souvent des comptes de service recrees automatiquement au
-            # demarrage -- les supprimer cree une boucle infinie. Conserves par defaut.
-            if ($DelUnknownDate) {
-                if ($DryRun) { $status = 'WhatIf'; $reason = 'Would be deleted -- unknown date (-DeleteUnknownDate active)' }
-                else {
-                    try {
-                        $profile | Remove-CimInstance -WhatIf:$false -ErrorAction Stop
-                        if (Test-Path $localPath) {
-                            Remove-Item -Path $localPath -Recurse -Force -WhatIf:$false -ErrorAction Stop
-                        }
-                        $status = 'Deleted'; $reason = 'Deleted -- unknown date (-DeleteUnknownDate active)'
-                    }
-                    catch { $status = 'Error'; $reason = $_.Exception.Message }
-                }
-            }
-            else {
-                $status = 'Skipped'
-                $reason = 'Unknown date -- skipped (use -DeleteUnknownDate to force)'
-            }
-        }
-        elseif ($daysOld -ge $Days) {
-            $age = "${daysOld}j"
-            if ($DryRun) { $status = 'WhatIf'; $reason = "Would be deleted -- inactive for $age" }
-            else {
-                try {
-                    $profile | Remove-CimInstance -WhatIf:$false -ErrorAction Stop
-                    if (Test-Path $localPath) {
-                        Remove-Item -Path $localPath -Recurse -Force -WhatIf:$false -ErrorAction Stop
-                    }
-                    $status = 'Deleted'; $reason = "Deleted -- inactive for $age"
-                }
-                catch { $status = 'Error'; $reason = $_.Exception.Message }
-            }
-        }
-        else { $status = 'Kept'; $reason = "Active ${daysOld}d ago" }
-
         $results.Add([PSCustomObject]@{
             Phase        = 'Profile'
             ComputerName = $env:COMPUTERNAME
-            Identifier   = $username
-            Detail       = $localPath
-            LastActivity = $lastActivity
-            DaysInactive = $daysOld
-            Loaded       = $profile.Loaded
+            Identifier   = $d.Username
+            Detail       = $d.LocalPath
+            LastActivity = $d.LastActivity
+            DaysInactive = $d.DaysOld
+            Loaded       = $d.Profile.Loaded
             Status       = $status
             Reason       = $reason
         })
     }
 
-    # ── Redemarrage de Windows Search si il tournait avant ────────────────────
+    # ── Restart WSearch if it was running before
     if ($wSearchWasRunning) {
         try {
             Start-Service -Name 'WSearch' -ErrorAction Stop
@@ -665,7 +792,7 @@ try {
     Write-Log "Phases         : $($phases -join ' | ')"
     Write-Log "Execution      : $(if ($useParallel) {"Parallel PS7 (ThrottleLimit: $ThrottleLimit)"} else {'Sequential'})"
     Write-Log "Threshold      : $DaysInactive days inactive"
-    Write-Log "Criterion      : Max(folder LastWriteTime, CIM LastUseTime)"
+    Write-Log "Criterion      : Max(ntuser.dat LastWriteTime, CIM LastUseTime)"
     Write-Log "Exclusions     : $($MergedExclusions.Count) rules loaded"
     Write-Log "Log file       : $LogFile"
     Write-Log "Log retention  : $LogRetentionDays days"
