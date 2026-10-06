@@ -6,7 +6,7 @@
 [![PS7 Parallel](https://img.shields.io/badge/PS7-Parallel%20mode-blueviolet?logo=powershell)](https://github.com/PowerShell/PowerShell)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-📖 [Lire en français](README_FR.md)
+[Version française](README.fr.md)
 
 ---
 
@@ -63,7 +63,7 @@ The two-pass architecture ensures WSearch is stopped **after** all dates are com
 ## Installation
 
 ```powershell
-git clone https://github.com/9lives-it/Invoke-ProfilePurge.git
+git clone https://github.com/9LivesITSolutions/Invoke-ProfilePurge.git
 cd Invoke-ProfilePurge
 Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 ```
@@ -252,13 +252,22 @@ Run as:    SYSTEM  (or elevated admin — SeRestorePrivilege required)
 
 ---
 
-## File Structure
+## Limitations
+
+- Profiles with no `ntuser.dat` and no `LastUseTime` are skipped unless `-DeleteUnknownDate` is set.
+- `-Parallel` requires PowerShell 7+.
+- Each target needs WinRM and an elevated administrator session (`SeRestorePrivilege`).
+- The Event Log source must be created once, with administrator rights.
+
+---
+
+## Project Structure
 
 ```
 Invoke-ProfilePurge/
 ├── Invoke-ProfilePurge.ps1   # Main script (EN)
 ├── README.md                 # This file
-├── README_FR.md              # French documentation
+├── README.fr.md              # French documentation
 ├── CHANGELOG.md              # Version history
 ├── LICENSE                   # MIT License
 ├── .gitignore
@@ -268,10 +277,22 @@ Invoke-ProfilePurge/
 
 ---
 
-## License
+## Contributing
 
-MIT — see [LICENSE](LICENSE).
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/my-feature`)
+3. Commit your changes (`git commit -m 'feat: add my-feature'`)
+4. Push to the branch (`git push origin feature/my-feature`)
+5. Open a Pull Request
+
+Please follow [Conventional Commits](https://www.conventionalcommits.org/) for commit messages.
 
 ---
 
-*9 Lives IT Solutions — Healthcare IT & Infrastructure Automation*
+## License
+
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+
+---
+
+Maintained by **9 Lives IT Solutions** — Healthcare IT & Infrastructure Automation.

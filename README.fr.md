@@ -6,7 +6,7 @@
 [![PS7 Parallel](https://img.shields.io/badge/PS7-Mode%20parall%C3%A8le-blueviolet?logo=powershell)](https://github.com/PowerShell/PowerShell)
 [![Licence: MIT](https://img.shields.io/badge/Licence-MIT-green.svg)](LICENSE)
 
-📖 [Read in English](README.md)
+[English version](README.md)
 
 ---
 
@@ -63,7 +63,7 @@ L'architecture deux passes garantit que WSearch est arrêté **après** le calcu
 ## Installation
 
 ```powershell
-git clone https://github.com/9lives-it/Invoke-ProfilePurge.git
+git clone https://github.com/9LivesITSolutions/Invoke-ProfilePurge.git
 cd Invoke-ProfilePurge
 Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
 ```
@@ -208,10 +208,47 @@ Exécuter   : SYSTEM  (ou admin élevé — SeRestorePrivilege requis)
 
 ---
 
-## Licence
+## Limites
 
-MIT — voir [LICENSE](LICENSE).
+- Les profils sans `ntuser.dat` et sans `LastUseTime` sont ignorés, sauf avec `-DeleteUnknownDate`.
+- `-Parallel` nécessite PowerShell 7+.
+- Chaque cible nécessite WinRM et une session administrateur élevée (`SeRestorePrivilege`).
+- La source du journal d'événements doit être créée une fois, avec les droits administrateur.
 
 ---
 
-*9 Lives IT Solutions — Informatique de santé & Automatisation d'infrastructure*
+## Structure du projet
+
+```
+Invoke-ProfilePurge/
+├── Invoke-ProfilePurge.ps1   # Script principal (EN)
+├── README.md                 # Documentation (EN)
+├── README.fr.md              # Documentation française
+├── CHANGELOG.md              # Historique des versions
+├── LICENSE                   # Licence MIT
+├── .gitignore
+├── servers.txt               # (non suivi) liste de serveurs
+└── whitelist.txt             # (non suivi) liste d'exclusions
+```
+
+---
+
+## Contribuer
+
+1. Forker le dépôt
+2. Créer une branche (`git checkout -b feature/ma-fonctionnalite`)
+3. Commiter (`git commit -m 'feat: add ma-fonctionnalite'`)
+4. Pousser la branche (`git push origin feature/ma-fonctionnalite`)
+5. Ouvrir une Pull Request
+
+Merci de suivre les [Conventional Commits](https://www.conventionalcommits.org/) pour les messages de commit.
+
+---
+
+## Licence
+
+Ce projet est distribué sous licence MIT. Voir le fichier [LICENSE](LICENSE).
+
+---
+
+Maintenu par **9 Lives IT Solutions** — Informatique de santé & automatisation d'infrastructure.
